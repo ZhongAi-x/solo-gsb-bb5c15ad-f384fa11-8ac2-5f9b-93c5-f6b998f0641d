@@ -30,6 +30,7 @@
 ### 设备组同步窗口汇总
 
 - **固定成员组**：创建组时显式给出成员设备、`aggregation`（`sum` 或 `avg`）以及窗口配置；所有成员设备必须已存在，且 `window_size_seconds` / `allowed_lateness_seconds` 与组配置完全一致（否则分别返回 404 / 409），保证各成员窗口在同一时间轴对齐、封存口径一致。成员在组创建后不可变更。
+- **成员配置锁定**：设备入组后，其窗口配置与所属组锁定一致——`PUT /devices/{id}/config` 提交的新配置与**任一**所属组不一致即返回 `409` 且**不写入**（防止成员尚无窗口时改窗口大小、或随时改允许迟到秒数，导致同组窗口时间范围或封存时点不一致、组汇总失真）；与组配置相同的重复提交幂等放行。组创建的成员校验与设备配置更新均在 `BEGIN IMMEDIATE` 可串行化写事务中完成，并发交错不会留下不一致配置；未入组设备沿用既有配置规则（有数据后窗口大小锁定、允许迟到秒数可随时调整）。
 - **同步封存才出数**：对每个 `window_start`，只有**全部成员**的设备窗口都已封存（sealed）时才生成组汇总（`status=ready`）；任一成员窗口仍 open 或尚无数据时，组窗口保持 `pending`、`value=null`，**绝不用部分成员提前计算**。
 - **聚合口径**：`sum` 为各成员窗口 `sum` 之和；`avg` 为各成员窗口 `avg`（窗口内事件均值）的算术平均，每个固定成员权重相同。
 - **修正原位升版**：成员窗口因迟到事件被修正后，已 ready 的组汇总在原记录上重算，`revision` 加一。系统以各成员窗口 `correction_count` 之和作为修正签名：同一 `event_id` 重试会被幂等去重、不产生新修正，签名不变，因此 **revision 不会重复升版**。ready 之前发生的修正包含在首次结果中，`revision` 从 1 起。
@@ -209,7 +210,7 @@ curl -X PUT http://localhost:8000/devices/sensor-001/config \
   -d '{"window_size_seconds": 60, "allowed_lateness_seconds": 30}'
 ```
 
-> 设备已有数据后不允许修改 `window_size_seconds`（返回 409），`allowed_lateness_seconds` 可随时调整。
+> 设备已有数据后不允许修改 `window_size_seconds`（返回 409），`allowed_lateness_seconds` 可随时调整。**已入组设备**的配置与所属组锁定一致：新配置与任一所属组的 `window_size_seconds` / `allowed_lateness_seconds` 不一致即返回 `409` 且不写入（与组配置相同的重复提交幂等放行）；组创建的成员校验与设备配置更新均在同一可串行化写事务（`BEGIN IMMEDIATE`）中完成，并发交错不会留下不一致配置。
 
 ### 2. 提交事件批次
 
@@ -885,7 +886,7 @@ curl 'http://localhost:8000/devices/sensor-001/integrity?start=2026-09-22T10:00:
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/ingest` | 按设备提交事件批次（幂等） |
 | `POST` | `/ingest/preview` | 预演批次提交（dry-run；与 /ingest 同请求体与判断口径，返回逐事件 accepted/duplicate/late、预计水位线及触及窗口预演后的 count/sum/status/correction_count；同快照按序推进，事务一律回滚不留任何写入） |
-| `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置 |
+| `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置（已入组设备的新配置须与全部所属组一致，否则 409 不写入；相同配置幂等放行） |
 | `GET` | `/devices` | 设备列表，支持 `?label_key=&label_value=` 按当前标签筛选 |
 | `GET` | `/devices/{device_id}` | 设备水位线与统计 |
 | `PUT` | `/devices/{device_id}/labels` | 全量替换设备标签（≤20 个键值对，键名规范化，版本 +1，支持 `if_version` 乐观并发，冲突 409） |

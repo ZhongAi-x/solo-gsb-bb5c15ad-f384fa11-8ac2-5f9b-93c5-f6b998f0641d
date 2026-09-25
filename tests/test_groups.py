@@ -250,3 +250,85 @@ def test_group_requires_matching_window_config(client):
     assert r.status_code == 409
     r = make_group(client, members=("d1", "d2"), window_size=300)
     assert r.status_code == 409
+
+
+def put_config(client, device_id, window_size=60, lateness=30):
+    return client.put(
+        f"/devices/{device_id}/config",
+        json={"window_size_seconds": window_size, "allowed_lateness_seconds": lateness},
+    )
+
+
+def test_member_config_locked_to_group_before_any_window(client):
+    # 成员仅预注册配置、尚无任何窗口数据
+    assert put_config(client, "d1").status_code == 200
+    assert put_config(client, "d2").status_code == 200
+    assert make_group(client).status_code == 201
+
+    # 成员尚无窗口也不能改窗口大小：409 且不写入
+    r = put_config(client, "d1", window_size=120)
+    assert r.status_code == 409
+    # 允许迟到秒数同样不能改：409 且不写入
+    r = put_config(client, "d1", lateness=45)
+    assert r.status_code == 409
+
+    info = client.get("/devices/d1").json()
+    assert info["window_size_seconds"] == 60
+    assert info["allowed_lateness_seconds"] == 30
+
+    # 与组配置相同的重复提交幂等放行
+    r = put_config(client, "d1")
+    assert r.status_code == 200
+    assert r.json()["window_size_seconds"] == 60
+    assert r.json()["allowed_lateness_seconds"] == 30
+
+
+def test_member_config_locked_to_group_after_data_ingested(client):
+    ingest(client, "d1", [{"event_id": "e1", "event_time": "2026-09-22T00:00:10Z", "value": 1.0}])
+    ingest(client, "d2", [{"event_id": "e1", "event_time": "2026-09-22T00:00:20Z", "value": 2.0}])
+    assert make_group(client).status_code == 201
+
+    # 已有数据的成员改窗口大小或允许迟到秒数都被组约束拒绝
+    assert put_config(client, "d1", window_size=120).status_code == 409
+    assert put_config(client, "d1", lateness=90).status_code == 409
+
+    info = client.get("/devices/d1").json()
+    assert info["window_size_seconds"] == 60
+    assert info["allowed_lateness_seconds"] == 30
+
+    # 组汇总口径不受影响：封存两成员后窗口仍按 60s 网格对齐出数
+    seal_window(client, "d1", event_id="s1")
+    seal_window(client, "d2", event_id="s2")
+    w = client.get("/groups/g1/windows/2026-09-22T00:00:00Z").json()
+    assert w["status"] == "ready"
+    assert w["value"] == 3.0
+
+
+def test_member_in_multiple_groups_must_match_all(client):
+    assert put_config(client, "d1").status_code == 200
+    assert put_config(client, "d2").status_code == 200
+    assert put_config(client, "d3").status_code == 200
+    assert make_group(client, group_id="g1", members=("d1", "d2")).status_code == 201
+    assert make_group(client, group_id="g2", members=("d1", "d3")).status_code == 201
+
+    # 与任一所属组不一致即拒绝
+    assert put_config(client, "d1", lateness=45).status_code == 409
+    assert put_config(client, "d1", window_size=300).status_code == 409
+    # 相同配置重复提交放行
+    assert put_config(client, "d1").status_code == 200
+
+    info = client.get("/devices/d1").json()
+    assert (info["window_size_seconds"], info["allowed_lateness_seconds"]) == (60, 30)
+
+
+def test_non_member_device_config_rules_unchanged(client):
+    # 未入组设备沿用现有规则：窗口大小在有数据前可改、允许迟到秒数随时可改
+    assert put_config(client, "free-1", window_size=120, lateness=10).status_code == 200
+    assert put_config(client, "free-1", window_size=300, lateness=10).status_code == 200
+    assert put_config(client, "free-1", window_size=300, lateness=99).status_code == 200
+    ingest(client, "free-1", [{"event_id": "e1", "event_time": "2026-09-22T00:00:10Z", "value": 1.0}])
+    # 有数据后窗口大小锁定，但允许迟到秒数仍可调整
+    assert put_config(client, "free-1", window_size=60, lateness=99).status_code == 409
+    r = put_config(client, "free-1", window_size=300, lateness=15)
+    assert r.status_code == 200
+    assert r.json()["allowed_lateness_seconds"] == 15

@@ -30,6 +30,7 @@
 ### 设备组同步窗口汇总
 
 - **固定成员组**：创建组时显式给出成员设备、`aggregation`（`sum` 或 `avg`）以及窗口配置；所有成员设备必须已存在，且 `window_size_seconds` / `allowed_lateness_seconds` 与组配置完全一致（否则分别返回 404 / 409），保证各成员窗口在同一时间轴对齐、封存口径一致。成员在组创建后不可变更。
+- **成员配置锁定**：设备入组后其窗口大小与允许迟到秒数锁定为组配置——即使尚无任何窗口也不得改窗口大小，允许迟到秒数也不得随时调整；`PUT /devices/{id}/config` 提交与任一所属组不一致的配置返回 `409` 且不写入，提交相同配置为幂等重复提交（`200`）。组创建的成员校验/落盘与设备配置更新均在 `BEGIN IMMEDIATE` 写锁事务内串行，杜绝并发交错留下配置漂移的成员。
 - **同步封存才出数**：对每个 `window_start`，只有**全部成员**的设备窗口都已封存（sealed）时才生成组汇总（`status=ready`）；任一成员窗口仍 open 或尚无数据时，组窗口保持 `pending`、`value=null`，**绝不用部分成员提前计算**。
 - **聚合口径**：`sum` 为各成员窗口 `sum` 之和；`avg` 为各成员窗口 `avg`（窗口内事件均值）的算术平均，每个固定成员权重相同。
 - **修正原位升版**：成员窗口因迟到事件被修正后，已 ready 的组汇总在原记录上重算，`revision` 加一。系统以各成员窗口 `correction_count` 之和作为修正签名：同一 `event_id` 重试会被幂等去重、不产生新修正，签名不变，因此 **revision 不会重复升版**。ready 之前发生的修正包含在首次结果中，`revision` 从 1 起。
@@ -209,7 +210,7 @@ curl -X PUT http://localhost:8000/devices/sensor-001/config \
   -d '{"window_size_seconds": 60, "allowed_lateness_seconds": 30}'
 ```
 
-> 设备已有数据后不允许修改 `window_size_seconds`（返回 409），`allowed_lateness_seconds` 可随时调整。
+> **未入组设备**已有数据后不允许修改 `window_size_seconds`（返回 409），`allowed_lateness_seconds` 可随时调整。**已入组设备**的两项配置均锁定为所属组配置：提交与任一所属组不一致的值——包括成员尚无窗口时改窗口大小、或随时改允许迟到秒数——一律返回 `409` 且不写入，以防同组窗口时间范围或封存时点错开、组汇总失真；提交完全相同的配置为幂等重复提交（`200`，也可借此把配置纠正回组配置）。组创建校验与设备配置更新都在 `BEGIN IMMEDIATE` 写锁事务内串行完成。
 
 ### 2. 提交事件批次
 
@@ -474,6 +475,7 @@ curl -X POST http://localhost:8000/groups \
 
 - 成员不存在 → `404`；窗口配置不一致或组 ID 已存在 → `409`；成员列表重复 → `400`。
 - 组创建后即对成员已有窗口做一次补算。
+- 成员入组后窗口配置锁定：对成员调用 config 接口提交与本组不一致的窗口大小或允许迟到秒数返回 `409` 且不写入（相同配置可重复提交）。
 
 ### 12. 按窗口查询组汇总
 
@@ -885,7 +887,7 @@ curl 'http://localhost:8000/devices/sensor-001/integrity?start=2026-09-22T10:00:
 | `GET` | `/health` | 健康检查 |
 | `POST` | `/ingest` | 按设备提交事件批次（幂等） |
 | `POST` | `/ingest/preview` | 预演批次提交（dry-run；与 /ingest 同请求体与判断口径，返回逐事件 accepted/duplicate/late、预计水位线及触及窗口预演后的 count/sum/status/correction_count；同快照按序推进，事务一律回滚不留任何写入） |
-| `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置 |
+| `PUT` | `/devices/{device_id}/config` | 创建/更新设备窗口与允许迟到配置（未入组设备有数据后禁改窗口大小；已入组设备两项均须与所属组一致，冲突 409 不写入，相同配置幂等 200；写锁事务） |
 | `GET` | `/devices` | 设备列表，支持 `?label_key=&label_value=` 按当前标签筛选 |
 | `GET` | `/devices/{device_id}` | 设备水位线与统计 |
 | `PUT` | `/devices/{device_id}/labels` | 全量替换设备标签（≤20 个键值对，键名规范化，版本 +1，支持 `if_version` 乐观并发，冲突 409） |
@@ -902,7 +904,7 @@ curl 'http://localhost:8000/devices/sensor-001/integrity?start=2026-09-22T10:00:
 | `PUT` | `/devices/{device_id}/alert-rule` | 设置/替换高值告警双阈值（trigger 必须严格高于 recovery，均为有限数；非法 400 且旧规则保留，设备不存在 404） |
 | `GET` | `/devices/{device_id}/alert` | 查询当前告警状态与生效规则（无规则 404；状态持久化、重启不丢） |
 | `GET` | `/devices/{device_id}/alert-episodes?start=&end=` | 告警周期与总告警秒数查询（只读；按转换流水自增顺序配对 entered/cleared，以流水 created_at 为起止，裁剪到 [start,end)，未解除周期计至 end 与查询时刻较早者；start/end 必填且 end>start 否则 422，设备或规则不存在 404，无相交周期返回空明细与 0） |
-| `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
+| `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验；成员校验与落盘在写锁事务内完成，与成员配置更新串行） |
 | `GET` | `/groups/{group_id}` | 组信息与成员列表 |
 | `GET` | `/groups/{group_id}/windows` | 组窗口汇总列表（支持 `?status=pending\|ready&window_start=...`） |
 | `GET` | `/groups/{group_id}/windows/{window_start}` | 查询单个组窗口 |

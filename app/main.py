@@ -33,6 +33,13 @@
 设备组同步窗口汇总：
 - 设备组为固定成员组，创建时所有成员设备必须存在且窗口配置一致
   （window_size_seconds / allowed_lateness_seconds），聚合方式为 sum 或 avg。
+- 入组期间成员配置被锁定：PUT /devices/{id}/config 对已入组设备提交与任一所属组
+  不一致的窗口大小或允许迟到秒数时一律返回 409 且不写入（成员尚无窗口也不得改窗口
+  大小，允许迟到秒数也不得随时改），避免同组窗口时间范围或封存时点错开导致组汇总
+  失真；提交与所属组完全相同的配置是幂等重复提交，返回 200。未入组设备沿用既有规则
+  （已有窗口数据后不得改窗口大小，允许迟到秒数可随时调整）。
+- 组创建的成员校验/落盘与设备配置更新都在 BEGIN IMMEDIATE 写锁事务内完成、彼此
+  串行，避免并发交错留下"已入组但配置漂移"的成员。
 - 同一 window_start 下仅当全部成员的设备窗口均已封存（sealed）时，
   才生成组汇总（ready）；任一成员窗口未封存（或尚无窗口）时保持 pending，
   value 为 NULL，绝不用部分成员提前计算。
@@ -794,6 +801,20 @@ def group_member_ids(conn: sqlite3.Connection, group_id: str) -> list[str]:
     return [r["device_id"] for r in rows]
 
 
+def device_group_rows(conn: sqlite3.Connection, device_id: str) -> list[sqlite3.Row]:
+    """返回设备所属的全部组（含各组窗口配置），按 group_id 升序。
+
+    设备可同时属于多个固定成员组；PUT config 时新配置必须与**每一个**所属组一致，
+    否则该设备在不同组里会落到不同的窗口网格 / 封存时点。
+    """
+    return conn.execute(
+        "SELECT g.* FROM device_groups g"
+        " JOIN device_group_members m ON m.group_id = g.group_id"
+        " WHERE m.device_id = ? ORDER BY g.group_id",
+        (device_id,),
+    ).fetchall()
+
+
 def reconcile_group(
     conn: sqlite3.Connection,
     group_id: str,
@@ -1423,8 +1444,22 @@ def ingest_preview(req: IngestRequest) -> IngestPreviewResponse:
 
 @app.put("/devices/{device_id}/config", response_model=DeviceOut)
 def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
-    """创建或更新设备配置。已有数据后不允许修改窗口大小（避免历史窗口口径不一致）。"""
-    with db.session() as conn:
+    """创建或更新设备配置。
+
+    - 未入组设备沿用既有规则：已有窗口数据后不允许修改窗口大小（避免历史窗口口径
+      不一致），允许迟到秒数可随时调整。
+    - 已入组设备的窗口大小与允许迟到秒数必须与**每一个所属组**保持一致：
+      任一组的窗口配置不同即返回 409 且不写入——即使该设备尚无任何窗口也不得改窗口
+      大小（否则同组 window_start 时间范围错开），允许迟到秒数同样不得随时改
+      （否则各成员封存时点不一致，组汇总会提前/延后出数）。提交与所属组完全相同的
+      配置属于幂等重复提交，返回 200（也可借此把历史漂移配置纠正回组配置）。
+
+    整个"读设备/读所属组 → 校验 → 写入"在单个 BEGIN IMMEDIATE 写锁事务内完成，
+    与同样持写锁的 POST /groups 串行化：组创建的成员校验与设备配置更新不可能交错，
+    不会留下"已入组但配置漂移"的成员。
+    """
+    # BEGIN IMMEDIATE：与组创建互斥，保证成员配置校验与设备配置更新串行
+    with db.immediate_session() as conn:
         dev = get_device(conn, device_id)
         if dev is None:
             conn.execute(
@@ -1433,19 +1468,46 @@ def put_device_config(device_id: str, cfg: DeviceConfig) -> DeviceOut:
                 (device_id, cfg.window_size_seconds, cfg.allowed_lateness_seconds, utcnow_iso()),
             )
         else:
-            if cfg.window_size_seconds != dev["window_size_seconds"]:
-                n = conn.execute(
-                    "SELECT COUNT(*) AS c FROM windows WHERE device_id = ?", (device_id,)
-                ).fetchone()["c"]
-                if n > 0:
+            groups = device_group_rows(conn, device_id)
+            if groups:
+                # 已入组：新配置必须与每个所属组一致；任一组不一致即拒绝、绝不写入。
+                mismatched = [
+                    g["group_id"]
+                    for g in groups
+                    if g["window_size_seconds"] != cfg.window_size_seconds
+                    or g["allowed_lateness_seconds"] != cfg.allowed_lateness_seconds
+                ]
+                if mismatched:
                     raise HTTPException(
                         status_code=409,
-                        detail="window_size_seconds cannot be changed after data has been ingested",
+                        detail=(
+                            "device is a group member; window config must stay identical to"
+                            " every group it belongs to (window_size_seconds and"
+                            " allowed_lateness_seconds). Conflicting groups: "
+                            + ", ".join(mismatched)
+                        ),
                     )
-            conn.execute(
-                "UPDATE devices SET window_size_seconds = ?, allowed_lateness_seconds = ? WHERE device_id = ?",
-                (cfg.window_size_seconds, cfg.allowed_lateness_seconds, device_id),
-            )
+                # 与所属组配置完全相同：幂等重复提交，按组配置落盘（可纠正历史漂移）。
+                conn.execute(
+                    "UPDATE devices SET window_size_seconds = ?, allowed_lateness_seconds = ?"
+                    " WHERE device_id = ?",
+                    (cfg.window_size_seconds, cfg.allowed_lateness_seconds, device_id),
+                )
+            else:
+                # 未入组：沿用既有规则——已有窗口数据后不允许修改窗口大小。
+                if cfg.window_size_seconds != dev["window_size_seconds"]:
+                    n = conn.execute(
+                        "SELECT COUNT(*) AS c FROM windows WHERE device_id = ?", (device_id,)
+                    ).fetchone()["c"]
+                    if n > 0:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="window_size_seconds cannot be changed after data has been ingested",
+                        )
+                conn.execute(
+                    "UPDATE devices SET window_size_seconds = ?, allowed_lateness_seconds = ? WHERE device_id = ?",
+                    (cfg.window_size_seconds, cfg.allowed_lateness_seconds, device_id),
+                )
         return device_out(conn, device_id)
 
 
@@ -2455,13 +2517,19 @@ def create_group(req: GroupCreate) -> GroupOut:
 
     成员设备必须均已存在，且窗口配置（window_size_seconds、allowed_lateness_seconds）
     与请求一致，保证同一 window_start 的成员窗口对齐、封存口径一致。
+
+    成员存在性/配置校验、组与成员落盘、历史窗口全量补算全部在单个 BEGIN IMMEDIATE
+    写锁事务内完成：校验通过到成员关系落盘之间不会有其他写事务插入，与同样持写锁的
+    PUT /devices/{id}/config 串行，杜绝"校验时一致、入组时已漂移"的并发交错；
+    校验失败（404/409）时整事务回滚，不留下半个组。
     """
     now = utcnow_iso()
     member_ids = req.member_ids
     if len(set(member_ids)) != len(member_ids):
         raise HTTPException(status_code=400, detail="member_ids must not contain duplicates")
 
-    with db.session() as conn:
+    # BEGIN IMMEDIATE：读成员配置 → 写组/成员关系 → 全量补算全程持写锁
+    with db.immediate_session() as conn:
         if conn.execute(
             "SELECT 1 FROM device_groups WHERE group_id = ?", (req.group_id,)
         ).fetchone():
